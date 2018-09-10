@@ -6,11 +6,12 @@ import (
 	"os/signal"
 	"syscall"
 
-	"github.com/golang/glog"
 	"github.com/libopenstorage/stork/drivers/volume"
 	_ "github.com/libopenstorage/stork/drivers/volume/portworx"
+	"github.com/libopenstorage/stork/pkg/controller"
 	"github.com/libopenstorage/stork/pkg/extender"
 	"github.com/libopenstorage/stork/pkg/initializer"
+	"github.com/libopenstorage/stork/pkg/migration"
 	"github.com/libopenstorage/stork/pkg/monitor"
 	"github.com/libopenstorage/stork/pkg/snapshot"
 	log "github.com/sirupsen/logrus"
@@ -85,6 +86,10 @@ func main() {
 			Name:  "health-monitor-interval",
 			Usage: "The interval in seconds to monitor the health of the storage driver (default: 120, min: 30)",
 		},
+		cli.BoolTFlag{
+			Name:  "migration-controller",
+			Usage: "Start the migration controller (default: true)",
+		},
 		cli.BoolFlag{
 			Name:  "app-initializer",
 			Usage: "EXPERIMENTAL: Enable application initializer to update scheduler name automatically (default: false)",
@@ -116,6 +121,20 @@ func run(c *cli.Context) {
 		log.Fatalf("Error initializing Stork Driver %v: %v", driverName, err)
 	}
 
+	config, err := rest.InClusterConfig()
+	if err != nil {
+		log.Fatalf("Error getting cluster config: %v", err)
+	}
+
+	k8sClient, err := clientset.NewForConfig(config)
+	if err != nil {
+		log.Fatalf("Error getting client, %v", err)
+	}
+
+	eventBroadcaster := record.NewBroadcaster()
+	eventBroadcaster.StartRecordingToSink(&core_v1.EventSinkImpl{Interface: core_v1.New(k8sClient.Core().RESTClient()).Events("")})
+	recorder := eventBroadcaster.NewRecorder(legacyscheme.Scheme, api_v1.EventSource{Component: "stork"})
+
 	if c.Bool("extender") {
 		ext = &extender.Extender{
 			Driver: d,
@@ -127,31 +146,17 @@ func run(c *cli.Context) {
 	}
 
 	runFunc := func(_ <-chan struct{}) {
-		runStork(d, c)
+		runStork(d, recorder, c)
 	}
 
 	leaderConfig := leaderelectionconfig.DefaultLeaderElectionConfiguration()
 	leaderConfig.LeaderElect = c.BoolT("leader-elect")
 
 	if leaderConfig.LeaderElect {
-		config, err := rest.InClusterConfig()
-		if err != nil {
-			log.Fatalf("Error getting cluster config: %v", err)
-		}
-
-		k8sClient, err := clientset.NewForConfig(config)
-		if err != nil {
-			log.Fatalf("Error getting client, %v", err)
-		}
 
 		leaderConfig.ResourceLock = resourcelock.ConfigMapsResourceLock
 		lockObjectName := c.String("lock-object-name")
 		lockObjectNamespace := c.String("lock-object-namespace")
-
-		eventBroadcaster := record.NewBroadcaster()
-		eventBroadcaster.StartLogging(glog.Infof)
-		eventBroadcaster.StartRecordingToSink(&core_v1.EventSinkImpl{Interface: core_v1.New(k8sClient.Core().RESTClient()).Events("")})
-		recorder := eventBroadcaster.NewRecorder(legacyscheme.Scheme, api_v1.EventSource{Component: "stork"})
 
 		id, err := os.Hostname()
 		if err != nil {
@@ -197,7 +202,12 @@ func run(c *cli.Context) {
 	}
 }
 
-func runStork(d volume.Driver, c *cli.Context) {
+func runStork(d volume.Driver, recorder record.EventRecorder, c *cli.Context) {
+	err := controller.Init()
+	if err != nil {
+		log.Fatalf("Error initializing controller: %v", err)
+	}
+
 	initializer := &initializer.Initializer{
 		Driver: d,
 	}
@@ -227,6 +237,21 @@ func runStork(d volume.Driver, c *cli.Context) {
 		}
 	}
 
+	if c.Bool("migration-controller") {
+		migration := migration.Migration{
+			Driver:   d,
+			Recorder: recorder,
+		}
+		if err = migration.Init(); err != nil {
+			log.Fatalf("Error initializing migration: %v", err)
+		}
+	}
+
+	// The controller should be started at the end
+	err = controller.Run()
+	if err != nil {
+		log.Fatalf("Error starting controller")
+	}
 	signalChan := make(chan os.Signal, 1)
 	signal.Notify(signalChan, syscall.SIGINT, syscall.SIGTERM)
 	for {
